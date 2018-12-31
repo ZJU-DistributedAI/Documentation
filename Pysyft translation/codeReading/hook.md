@@ -1,20 +1,28 @@
+# 论文部分
+
+![](./hook/pysyft1.png)
+> SyftTensors表示数据的状态或者转换(不存放真实数据)，相互之间可以链接在⼀一
+> Wrapper (FloatTensor) -> LocalTensor (our class) -> FloatTensor (actually holds the data)
+
+注意：Wrapper就是包装器，被pytorch其余使用，一起工作，统一接口; operation and transaformation 就是 LocalTensor; FloatTensor就是真实存放数据的FloatTensor
+
+如何包装成 -> ? LocalTensor  LocalTensor如何连接到FloatTensor？ 增加属性？名字修改？ 
+
 # TorchHook简介
 define: class TorchHook() is designed for "A Hook which Overrides Methods on PyTorch Variables & Tensors"
 即 完成重载 pytorch的 variables 和 Tensors.
 
 结合论文中的图，
-
-![](./hook/pysyft1.png)
 是LocalTensor的方法，执行Hook中的操作，可以将多个tensor连接。
 
 # 解析Hook源代码
 class目的：
 
-- [扩展pytorch方法：允许移动tensor和variables 从一个worker到另一个worker ]
+- [扩展pytorch方法：允许移动tensor和variables 从一个worker到另一个worker] 如何去做？
 
 `extend torch methods to allow for the moving of tensors and variables from one worker to another.` 
 
-- [重写pytorch方法：在一个worker上执行命令，这个命令被称为tensor受localworker控制]
+- [重写pytorch方法：在一个worker上执行命令，这个命令被称为tensor受localworker控制] 如何去做？
 
 `override torch methods to execute commands on one worker that are called on tensors controlled by the local worker.`
 
@@ -27,7 +35,10 @@ class目的：
 - verbose（bool，可选）是否打印操作当他们发生。 （Defalt：True）
 - queue_size (int, optional)max length of the list storing messages to be sent. (Default: 0)
 
-## 初始化
+## `__init__`
+
+ 1. 设置 TorchHook 挂载 local_worker;
+ 2. 设置 torch.syft_tensor_name
 
 ``` python
 def __init__(self, local_worker=None, is_client=True, verbose=True, queue_size=0):
@@ -55,7 +66,7 @@ def __init__(self, local_worker=None, is_client=True, verbose=True, queue_size=0
         ]
     # 加载列表
     self.to_auto_overload = {}
-        if torch.torch_hooked > 0:         # 已经被挂载
+    if torch.torch_hooked > 0:         # 已经被挂载
         logging.warn("Torch was already hooked... skipping hooking process")
         self.local_worker = sy.local_worker    
     else: 
@@ -76,17 +87,16 @@ def __init__(self, local_worker=None, is_client=True, verbose=True, queue_size=0
             self.local_worker.hook = self
             
     # 对PyTorch Tensor 增加 pysyft方法 迭代 通过Torch tensor 添加PySyft张量函数
-    
-    # torch.tensorvar_types = torch.tensor_types + [torch.autograd.variable.Variable]
+    # init中: torch.tensorvar_types = torch.tensor_types(torch.FloatTensor,...) + [torch.autograd.variable.Variable]
     for typ in torch.tensorvar_types:
         # 重载 给定的pytorch tensors and variable 添加方法  
         self._hook_native_tensors_and_variables(typ)
-        # 重载 pytorch张量with Syft tensor types
+        # 重载 pytorch张量with Syft tensor types (LocalTensor,PointerTensor)
         self._hook_syft_tensor_types(typ)
     
-    self._hook_torch_module() # 重载 pytorch module
-    self._hook_backward() # 重载 pytorch backward
-    self._hook_module() #  重载 其他 module
+    self._hook_torch_module() # 重载 pytorch module; move torch.module  to native_<function_name_here>
+    self._hook_backward() # 重载 pytorch backward 其中的id属性
+    self._hook_module() #  重载 torch.nn
     
     torch.eval_torch_modules()
     sy.local_worker = self.local_worker
@@ -99,12 +109,13 @@ def _hook_native_tensors_and_variables(self, tensor_type: torch.tensor):
     """
     Overloads given native tensor type (Torch Tensor) to add PySyft Tensor Functionality
     parameters: tensor_type: A Torch tensor
-    重载 给定本机native张量类型（Torch Tensor）的以添加PySyft Tensor功能
+    重载 给定native张量类型（Torch Tensor）的来添加PySyft Tensor功能
     参数：tensor_type：A Torch tensor
     """
-    # Reinitialize init method of Torch tensor with Syft init 用 Syft初始化方法 重新初始化TorchTensor的初始化方法 => 生成owner， id等
+    # Reinitialize init method of Torch tensor with Syft init 用 Syft初始化方法 重新初始化TorchTensor的初始化方法 => 将syftTensor.native_init_设置成tensorVarType._init_；syftTensor_init_生成owner，id等
     self._add_registration_to___init__(tensor_type, register_child_instead=True)
-    # Overaload Torch tensor properties with Syft properties  用Syft的属性重载PyTorch tensor的属性
+    # Overaload Torch tensor properties with Syft properties  用Syft的属性重载PyTorch tensor的属性 = >Wrapper
+    # 将属性设置到子类 hook中 Wrapper连接到LocalTensor；LocalTensor连接到FloatTensor
     self._hook_properties(tensor_type)
     # Returns a list of methods to be overloaded  which would be saved in a dictionary variable to_auto_overload with tensor_type being the key
 # 返回一系列被重载的方法，这些方法将会被保存在一个名为to_auto_overload的字典中，tensor_type将作为key。
@@ -122,6 +133,11 @@ def _hook_native_tensors_and_variables(self, tensor_type: torch.tensor):
 def _add_registration_to___init__(hook_self, tensorvar_type, register_child_instead=False):
     '''
     Overloads tensor_type.__init__ or Variable.__init__ of Torch tensors to add PySyft tensor functionality
+# TODO: This is added because of the following contradiction: instanciate x = FloatTensor()
+        # and ask x.__module__, you'll get `sy.core.frameworks.torch.tensor.FloatTensor`
+        # but now ask for dir(sy.core.frameworks.torch.tensor) you'll find no FloatTensor attribute
+        # and x.float() will raise an exception because of this.
+        # Why is x.__module__ == 'sy.core...'? How can we do this with elegance?
 
 # 因为初始化实例 x = FloatTensor(),在sy.core.framework.torch no FloatTensor
     '''
@@ -160,20 +176,41 @@ def _hook_properties(hook_self, tensor_type):
 '''
 Overloads tensor_type properties；
 Parameters: tensor_type: Torch tensor
+# 既能检查参数，又可以用类似属性这样简单的方式来访问类的变量
 # Python内置的@property装饰器就是负责把一个方法变成属性调用的;
 # 把一个getter方法变成属性，只需要加上@property就可以了，此时，@property本身又创建了另一个装饰器@score.setter，
 # 负责把一个setter方法变成属性赋值，于是，我们就拥有一个可控的属性操作;还可以定义只读属性，只定义getter方法，不定义setter方法就是一个只读属性
 '''
-@property  					
-def child(self):
-try:
- try:
-    assert self._child is not None
-    return self._child
-except (AttributeError, AssertionError):
-    self._child = _LocalTensor(child=self, parent=self, torch_type=type(self).__name__))
-    return self._child
+@property
+        def child(self):
+            try:
+                try:
+                    assert self._child is not None
+                    return self._child
+                except (AttributeError, AssertionError):
+                    // 设置wrapper的child为LocalTensor
+                    self._child = _LocalTensor(
+                        child=self, parent=self, torch_type=type(self).__name__
+                    )
+                    return self._child
+            except TypeError:
+                # for some reason, hasattr(self, '_child') returns a TypeError saying
+                # "TypeError: 'NoneType' object is not callable". It's supposed to only
+                # return False and I can't get to the bottom of it. So, for now, I'm
+                # going to break a personal rule and use try/catch for logic, but
+                # this is merely supposed to evaluate whether self has ._child as an
+                # attribute. Note this only seems to happen when self is a
+                # torch.autograd.Variable
 
+                self._child = _LocalTensor(
+                    child=self, parent=self, torch_type=type(self).__name__
+                )
+                return self._child
+
+        @child.setter
+        def child(self, value):
+            self._child = value
+     # 将属性设置到子类 hook中 Wrapper连接到LocalTensor；LocalTensor连接到FloatTensor
      tensor_type.child = child
      tensor_type.id = id
      tensor_type.location = location
@@ -427,7 +464,41 @@ def _get_overloaded_method(hook_self, attr):
 ```
 
 
-### `def _hook_backward(hook_self):`
+## `_hook_torch_module`
+
+```python
+def _hook_torch_module(self):
+        """Overloads functions in the main torch module.
+        The way this is accomplished is by first moving all existing module functions in the torch
+        module to native_<function_name_here>. Thus, the real :func:`torch.cat` will become
+        :func:`torch.native_cat` and :func:`torch.cat` will have our hooking code.
+        """
+
+        for module_name, module_funcs in torch.torch_modules.items():
+            torch_module = eval(module_name)
+            for attr in module_funcs:
+                # Some functions we want to ignore (not override). Such functions have been hard
+                # coded into the attribute self.torch_exclude
+                if attr in torch.torch_exclude:
+                    continue
+
+                # if we haven't already overloaded this function
+                if f"native_{attr}" in dir(torch_module):
+                    continue
+
+                # if we haven't already overloaded this function (redundancy allowed)
+                if "native_" in attr:
+                    continue
+
+                # Where the overloading happens
+                lit = getattr(torch_module, attr)
+                if type(lit) in [types.FunctionType, types.BuiltinFunctionType]:
+                    new_attr = self._get_overloaded_function(module_name + "." + attr)
+                    setattr(torch_module, f"native_{attr}", lit)
+                    setattr(torch_module, attr, new_attr)
+```
+
+## ` _hook_backward(hook_self):`
 
 ```python
  def _hook_backward(hook_self):
@@ -486,7 +557,7 @@ def _get_overloaded_method(hook_self, attr):
         sy.Variable.native_backward = new_backward
 ```
 
-### `def _hook_module(self):`
+## `_hook_module(self):`
 
 ```python
 def _hook_module(self):
